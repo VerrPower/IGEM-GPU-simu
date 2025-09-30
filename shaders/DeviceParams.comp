@@ -1,0 +1,167 @@
+
+#extension GL_EXT_shader_integer_mix : require
+#extension GL_ARB_gpu_shader_int64 : enable
+#extension GL_EXT_shader_atomic_int64 : enable
+
+#if defined(GL_ARB_gpu_shader_int64)
+#else
+#error "64-bit integers not supported!"
+#endif
+
+#define Pi 3.1415926535f
+
+// ————————————————————————————————————— debug switches —————————————————————————————————————
+#define ENABLE_SAS_CORRECTION
+#define ENABLE_RUN_AND_TUMBLE
+#define ENABLE_COL_DETECT
+
+// float_buf: NORM NORM NORM EXPO  int_buf: TWOP
+// —————————————————————————————————————— RAT settings ——————————————————————————————————————
+#define RUN_SPEED_mean                          6.08
+#define RUN_SPEED_sigma                         1.3
+#define RUN_SPEED_LOWER_BOUND                   2.0
+#define RUN_SPEED_UPPER_BOUND                   10.0
+
+#define RUN_COAST_DURATION_RATIO                0.8f
+#define RUN_DURATION_mean                       8.0
+#define RUN_DURATION_sigma                      1.0
+#define RUN_DURATION_LOWER_BOUND                5.0
+#define RUN_DURATION_UPPER_BOUND                12.0
+
+#define ROTATE_COAST_DURATION_RATIO             0.8f
+#define ROTATE_DURATION_mean                    0.5
+#define ROTATE_DURATION_LOWER_BOUND             0.3
+#define ROTATE_DURATION_UPPER_BOUND             5.0
+
+#define ROTATE_ANGLE_mean                       (Pi * 5 / 12)
+#define ROTATE_ANGLE_sigma                      (Pi / 12)
+#define ROTATE_ANGLE_LOWER_BOUND                (Pi / 4)
+#define ROTATE_ANGLE_UPPER_BOUND                (Pi * 3 / 4)
+
+// —————————————————————————————————————— particle number and size ——————————————————————————————————————
+#define AREA_UM2                                1e6   // * in sync with host
+#define CAPSULE_PER_SQUARE_UM                   0.01   // * in sync with host
+#define CIRCLE_PER_SQUARE_UM                    0.0013   // * in sync with host
+#define CAPSULE_CENTER_DIST                     1.9f   // * in sync with host
+#define CAPSULE_RADIUS                          0.5f   // * in sync with host
+#define CIRCLE_RADIUS                           1.2f   // * in sync with host
+#define MAX_CAPSULE_PER_CELL                    64   // * in sync with host
+#define MAX_CIRCLE_PER_CELL                     32   // * in sync with host
+#define MAX_COLLISIONS_CONCURRENT_PER_CAPSULE   64   // * in sync with host
+
+#define NUM_CAPSULE                             (int(AREA_UM2 * CAPSULE_PER_SQUARE_UM))   // * in sync with host
+#define NUM_CIRCLE                              (int(AREA_UM2 * CIRCLE_PER_SQUARE_UM))   // * in sync with host
+#define BOUND_X                                 sqrt(AREA_UM2)   // * in sync with host
+#define BOUND_Y                                 sqrt(AREA_UM2)   // * in sync with host
+#define CELL_SIZE                               ((CAPSULE_CENTER_DIST + 2.0f * CAPSULE_RADIUS) * 3.0f)   // * in sync with host
+#define GRID_WIDTH                              (int(ceil(BOUND_X / CELL_SIZE)))   // * in sync with host
+#define GRID_HEIGHT                             (int(ceil(BOUND_Y / CELL_SIZE)))   // * in sync with host
+#define NUM_CELLS                               (GRID_WIDTH * GRID_HEIGHT)   // * in sync with host
+
+#define WG_SIZE                                 64   // * in sync with host
+#define WORKLOAD_POW                            4    // * in sync with host
+
+// —————————————————————————————————————— ssbo binding port ——————————————————————————————————————
+#define CAPSULE_MOTION_PORT                     1   // * in sync with host
+#define CAPSULE_IDXTBL_PORT                     2   // * in sync with host
+#define CAPSULE_CNTLST_PORT                     3   // * in sync with host
+#define CAPSULE_MODEL_PORT                      4   // * in sync with host
+#define CAPSULE_INFO_PORT                       5   // * in sync with host
+#define CIRCLE_STRUCT_PORT                      11   // * in sync with host
+#define CIRCLE_IDXTBL_PORT                      12   // * in sync with host
+#define CIRCLE_CNTLST_PORT                      13   // * in sync with host
+#define CIRCLE_MODEL_PORT                       14   // * in sync with host
+#define DEVICE_INT_BUF_PORT                     16   // * in sync with host
+#define DEVICE_FLOAT_BUF_PORT                   17   // * in sync with host
+#define DEBUG_PORT                              29   // * in sync with host
+#define GLOBAL_COUNTER_PORT                     30   // * in sync with host
+#define OUTPUT_PORT                             31   // * in sync with host
+
+#ifdef ENABLE_RUN_AND_TUMBLE
+#define RAT_ENABLED
+#endif
+#ifdef ENABLE_COL_DETECT
+#define COLLISION_DETECTION_ENABLED
+#endif
+#ifdef ENABLE_SAS_CORRECTION
+#define SAS_ENABLED
+#endif
+
+#define UPS                                     120.0f
+#define dt                                      (1.0f / UPS)
+#define dt2                                     (dt * dt)
+
+
+const float rE = CAPSULE_RADIUS;
+const float rC = CIRCLE_RADIUS;
+const float hE = CAPSULE_CENTER_DIST;
+const float hhE = hE / 2;
+const float m = Pi*rE + 2*hE;
+const float I = 0.5f*Pi*rE*rE*rE + 0.25f*Pi*rE*hE*hE + (8.0f/3.0f)*rE*rE*hE + (2.0f/3.0f)*hE*hE*hE;
+/*const float m_over_I = m / I;
+const float I_over_m = I / m;*/
+const float m_inv = 1.0f / m;
+const float I_inv = 1.0f / I;
+const float cell_sz_inv = (1.0f / CELL_SIZE);
+const float bound_x_inv = (1.0f / BOUND_X);
+const float bound_y_inv = (1.0f / BOUND_Y);
+
+// ———————————————————————————————————————— structures ————————————————————————————————————————
+struct Capsule {
+    vec2 pos;   // 8
+    vec2 prev_pos;   // ~16
+    vec2 acc;  // 24
+    float theta;  //28
+    float prev_theta;   //~32
+    float angular_acc;  //36
+    int overlapped;    // 40
+    int motion_state;  // 44
+    int cooldown;   // ~48
+};
+
+struct CapsuleState {
+    vec2 run_coast_vel;         // 8
+    float rotate_coast_omega;   // 12
+    int run_coast_frames;       // ~16
+    int run_decel_frames;       // 20
+    int rotate_coast_frames;    // 24
+    int rotate_decel_frames;    // 28
+    int _pad0;                  // ~32
+};
+
+struct Obstacle {
+    vec2 pos;
+    float health;
+    int _pad0;
+};
+
+
+layout(std430, binding = CAPSULE_MOTION_PORT)   buffer CapStructBuf    { Capsule         capsules[NUM_CAPSULE]; };
+layout(std430, binding = CAPSULE_CNTLST_PORT)   buffer CapCountBuf     { uint            counts_list[NUM_CELLS]; };
+layout(std430, binding = CAPSULE_IDXTBL_PORT)   buffer CapIndexBuf     { uint            indices_table[MAX_CAPSULE_PER_CELL * NUM_CELLS]; };
+layout(std430, binding = CAPSULE_MODEL_PORT)    buffer CapModelBuf     { mat4            ecoli_models[NUM_CAPSULE]; };
+layout(std430, binding = CAPSULE_INFO_PORT)     buffer CapInfoBuf      { CapsuleState  capsule_info[NUM_CAPSULE]; };
+
+layout(std430, binding = CIRCLE_STRUCT_PORT)    buffer CircleStructBuf { Obstacle        cauris[NUM_CIRCLE]; };
+layout(std430, binding = CIRCLE_IDXTBL_PORT)    buffer CircleIndexBuf  { uint            indices_table_f[MAX_CIRCLE_PER_CELL * NUM_CELLS]; };
+layout(std430, binding = CIRCLE_CNTLST_PORT)    buffer CircleCountBuf  { uint            counts_list_f[NUM_CELLS]; };
+layout(std430, binding = CIRCLE_MODEL_PORT)     buffer CircleModelBuf  { mat4            cauris_models[NUM_CIRCLE]; };
+
+layout(std430, binding = DEVICE_FLOAT_BUF_PORT) buffer DeviceFloatBuf  { float           device_float_buf[]; };
+layout(std430, binding = DEVICE_INT_BUF_PORT)   buffer DeviceIntBuf    { int             device_int_buf[]; };
+
+layout(std430, binding = GLOBAL_COUNTER_PORT) buffer GlobalCounter{ uint g_counter; };
+layout(std430, binding = DEBUG_PORT) buffer DebugBuffer{ int debug_int; };
+layout(std430, binding = OUTPUT_PORT) buffer OutputBuffer{ float kinetics[]; };
+
+
+
+
+
+
+
+
+
+
+
+

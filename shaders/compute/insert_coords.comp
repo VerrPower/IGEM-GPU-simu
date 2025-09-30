@@ -1,0 +1,21 @@
+// insert
+#version 460 core
+
+#include "DeviceParams.comp"
+
+layout( local_size_x = WG_SIZE,
+        local_size_y = 1,
+        local_size_z = 1
+) in;
+
+void main() {
+    uint EID = gl_GlobalInvocationID.x;
+    if(EID >= NUM_CAPSULE) return;
+    vec2 pos = capsules[EID].pos;
+    int cell_x = clamp(int(pos.x * cell_sz_inv), 0, GRID_WIDTH  - 1);
+    int cell_y = clamp(int(pos.y * cell_sz_inv), 0, GRID_HEIGHT - 1);
+    uint cell_id = uint(cell_y) * GRID_WIDTH + uint(cell_x);
+    uint cnt = atomicAdd(counts_list[cell_id], 1u);
+    uint index = cell_id * MAX_CAPSULE_PER_CELL + cnt;
+    indices_table[index] = EID;
+}

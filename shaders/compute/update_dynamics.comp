@@ -1,0 +1,181 @@
+// update
+#version 460 core
+
+#include "DeviceParams.comp"
+
+layout( local_size_x = WG_SIZE,
+        local_size_y = 1,
+        local_size_z = 1
+) in;
+
+#define OMEGA_N 1.4f
+#define ZETA    1.0f
+
+#define K_p (OMEGA_N * OMEGA_N)
+#define K_d (2 * OMEGA_N * ZETA)
+
+#if defined(RAT_ENABLED)
+#define NEUTRAL                      0
+#define NEUTRAL_to_ROTATE_DAMPING    1
+#define ROTATE_ACCEL                 2
+#define ROTATE_COAST                 3
+#define ROTATE_to_RUN_DAMPING        4
+#define RUN_ACCEL                    5
+#define RUN_COAST                    6
+#define RUN_to_ROTATE_DAMPING        7
+const int next_state_table[] ={
+    NEUTRAL_to_ROTATE_DAMPING ,  // old_state: NEUTRAL                      old_bit: 0    INDEX: [0]    -——to——>  NEUTRAL_to_ROTATE_DAMPING   new_bit: 1
+    ROTATE_ACCEL,                // old_state: NEUTRAL_to_ROTATE_DAMPING    old_bit: 1    INDEX: [1]    -——to——>  ROTATE_ACCEL                new_bit: 2
+    ROTATE_COAST ,               // old_state: ROTATE_ACCEL                 old_bit: 2    INDEX: [2]    -——to——>  ROTATE_COAST                new_bit: 3
+    ROTATE_to_RUN_DAMPING ,      // old_state: ROTATE_COAST                 old_bit: 3    INDEX: [3]    -——to——>  ROTATE_to_RUN_DAMPING       new_bit: 4
+    RUN_ACCEL ,                  // old_state: ROTATE_to_RUN_DAMPING        old_bit: 4    INDEX: [4]    -——to——>  RUN_ACCEL                   new_bit: 5
+    RUN_COAST ,                  // old_state: RUN_ACCEL                    old_bit: 5    INDEX: [5]    -——to——>  RUN_COAST                   new_bit: 6
+    RUN_to_ROTATE_DAMPING,       // old_state: RUN_COAST                    old_bit: 6    INDEX: [6]    -——to——>  RUN_to_ROTATE_DAMPING       new_bit: 7
+    ROTATE_ACCEL                 // old_state: RUN_to_ROTATE_DAMPING        old_bit: 7    INDEX: [7]    -——to——>  ROTATE_ACCEL                new_bit: 2
+};
+#endif
+
+#define _bd_x_inv (1.0f / BOUND_X)
+#define _bd_y_inv (1.0f / BOUND_Y)
+
+float SAS_angular_acceleration(float theta, vec2 vel, float omega){
+    vec2 d0 = normalize(vel);
+    float d1x = cos(theta), d1y = sin(theta);
+    float cos_theta = d0.x * d1x + d0.y * d1y;
+    float sin_theta = d0.x * d1y - d0.y * d1x;
+    float delta_theta = atan(sin_theta, cos_theta);
+    float alpha =  - K_p * delta_theta - K_d * omega;
+    return alpha;
+}
+
+void main() {
+    uint EID = gl_GlobalInvocationID.x;
+    if(EID >= NUM_CAPSULE) return;
+    Capsule P = capsules[EID];
+    vec2 pos = P.pos, prev_pos = P.prev_pos;
+    float theta = P.theta, prev_theta = P.prev_theta;
+    vec2 acc = P.acc; float angular_acc = P.angular_acc;
+    vec2 vel = (pos - prev_pos) / dt;
+    float omega = (theta - prev_theta) / dt;
+
+    //@———————————————————————— run-and-tumble ————————————————————————@
+    #ifdef RAT_ENABLED
+    int now_state = P.motion_state;
+    int now_cooldown = P.cooldown;
+    bool do_forced_neutralize = bool(P.overlapped);
+    bool do_proceed_state = bool(now_cooldown == 0);
+    int next_state, next_cooldown;
+    CapsuleState Info = capsule_info[EID];
+    if(!do_forced_neutralize){
+        if(!do_proceed_state){
+            next_state = now_state;
+            next_cooldown = now_cooldown - 1;
+            float rs = float(UPS) / float(now_cooldown);
+            switch(next_state){   // NO STATE CHANGE, MOST COMMON SENARIO
+                case NEUTRAL:
+                #ifdef SAS_ENABLED
+                    angular_acc += SAS_angular_acceleration(theta, vel, omega);
+                #endif
+                    break;
+                case NEUTRAL_to_ROTATE_DAMPING:
+                    acc += -vel * rs; angular_acc += -omega * rs; break;
+                case RUN_ACCEL:
+                    acc += (Info.run_coast_vel - vel) * rs; break;
+                case RUN_to_ROTATE_DAMPING:
+                    acc += -vel * rs; break;
+                case ROTATE_ACCEL:
+                    angular_acc += (Info.rotate_coast_omega - omega) * rs; break;
+                case ROTATE_to_RUN_DAMPING:
+                    angular_acc += -omega * rs; break;
+                default: break;
+            }
+        }
+        else {
+            next_state = next_state_table[now_state];
+            switch (next_state){
+                case NEUTRAL_to_ROTATE_DAMPING:
+                    next_cooldown = 240; break;
+                case ROTATE_ACCEL:
+                    // calculate and buffer future dynamic info.
+                    float _s1 = device_float_buf[3 * NUM_CAPSULE + EID] * ROTATE_DURATION_mean;
+                    float rotate_total_sec = clamp(_s1, ROTATE_DURATION_LOWER_BOUND, ROTATE_DURATION_UPPER_BOUND);
+                    float rotate_coast_sec = rotate_total_sec * ROTATE_COAST_DURATION_RATIO;
+                    float rotate_accel_sec = (rotate_total_sec - rotate_coast_sec) * 0.5f;
+                    int rotate_coast_frames = int(rotate_coast_sec * float(UPS));
+                    int rotate_accel_frames = int(rotate_accel_sec * float(UPS));
+                    int rotate_decel_frames = rotate_accel_frames;
+                    float _s2 = device_float_buf[NUM_CAPSULE + EID] * ROTATE_ANGLE_sigma + ROTATE_ANGLE_mean;
+                    float _s2C = clamp(_s2, ROTATE_ANGLE_LOWER_BOUND, ROTATE_ANGLE_UPPER_BOUND);
+                    float _sgn = 2.0f * float(device_int_buf[EID]) - 1.0f;
+                    float rotate_coast_omega = _s2C * _sgn / (rotate_coast_sec + rotate_accel_sec);
+                    Info.rotate_coast_frames = rotate_coast_frames;
+                    Info.rotate_decel_frames = rotate_decel_frames;
+                    Info.rotate_coast_omega  = rotate_coast_omega;
+                    next_cooldown = rotate_accel_frames; break;
+                case ROTATE_COAST:
+                    next_cooldown = Info.rotate_coast_frames; break;
+                case ROTATE_to_RUN_DAMPING:
+                    next_cooldown = Info.rotate_decel_frames; break;
+
+                case RUN_ACCEL:
+                    float _s3 = device_float_buf[EID * 2 + 0] * RUN_DURATION_sigma + RUN_DURATION_mean;
+                    float run_total_sec = clamp(_s3, RUN_DURATION_LOWER_BOUND, RUN_DURATION_UPPER_BOUND);
+                    int run_coast_frames = int(run_total_sec * RUN_COAST_DURATION_RATIO * float(UPS));
+                    int run_accel_frames = int((run_total_sec * float(UPS) - run_coast_frames) * 0.5f);
+                    int run_decel_frames = run_accel_frames;
+                    float _s4 = device_float_buf[EID * 2 + 1] * RUN_SPEED_sigma + RUN_SPEED_mean;
+                    float speed = clamp(_s4, RUN_SPEED_LOWER_BOUND, RUN_SPEED_UPPER_BOUND);
+                    vec2 run_coast_vel = speed * vec2(cos(theta), sin(theta));
+                    Info.run_coast_vel = run_coast_vel;
+                    Info.run_coast_frames = run_coast_frames;
+                    Info.run_decel_frames = run_decel_frames;
+                    next_cooldown = run_accel_frames; break;
+                case RUN_COAST:
+                    next_cooldown = 100; break;
+                case RUN_to_ROTATE_DAMPING:
+                    next_cooldown = Info.run_decel_frames; break;
+                default: break;
+            }
+        }
+        capsule_info[EID] = Info;
+    }
+    else{
+        next_cooldown = 200;
+        next_state = NEUTRAL;
+    }
+    capsules[EID].motion_state = next_state;
+    capsules[EID].cooldown = next_cooldown;
+    #elif defined(SAS_ENABLED)
+    angular_acc += bool(P.overlapped) ? 0.0f : SAS_angular_acceleration(theta, vel, omega);
+    #endif
+
+    //@———————————————————————— Verlet integration ————————————————————————@
+    vec2 pos_n = 2 * pos - prev_pos + acc * dt2;
+    prev_pos = pos; pos = pos_n;
+    float theta_n = 2 * theta - prev_theta + angular_acc * dt2;
+    prev_theta = theta; theta = theta_n;
+    float orient_x = cos(theta), orient_y = sin(theta);
+    acc.x = 0.0f; acc.y = 0.0f; angular_acc = 0.0f;
+
+    //@———————————————————————— boundary wrapping ————————————————————————@
+    float shift_x = floor(pos.x * _bd_x_inv) * BOUND_X;
+    pos.x -= shift_x; prev_pos.x -= shift_x;
+    float shift_y = floor(pos.y * _bd_y_inv) * BOUND_Y;
+    pos.y -= shift_y; prev_pos.y -= shift_y;
+
+    ecoli_models[EID] = mat4(
+        vec4( orient_x, orient_y, 0, 0),
+        vec4(-orient_y, orient_x, 0, 0),
+        vec4(   0.0,    0.0,      1, 0),
+        vec4(            pos,     0, 1)
+    );
+
+    kinetics[EID] = 0.5f * dot(vel, vel) * m + 0.5f * omega * omega * I;
+
+    capsules[EID].pos = pos;
+    capsules[EID].prev_pos = prev_pos;
+    capsules[EID].theta = theta;
+    capsules[EID].prev_theta = prev_theta;
+    capsules[EID].acc = acc;
+    capsules[EID].angular_acc = angular_acc;
+}

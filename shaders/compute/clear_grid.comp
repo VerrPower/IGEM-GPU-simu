@@ -1,0 +1,21 @@
+#version 460 core
+
+#include "DeviceParams.comp"
+
+layout( local_size_x = WG_SIZE,
+        local_size_y = 1,
+        local_size_z = 1
+) in;
+
+#define workload (1 << WORKLOAD_POW)
+
+void main(){
+    uint lid = gl_GlobalInvocationID.x;
+    uint local_start = lid << WORKLOAD_POW;
+    if(local_start < NUM_CELLS){
+        uint local_end = min(local_start + workload, NUM_CELLS);
+        for(uint i = local_start; i < local_end; i++){
+            counts_list[i] = 0u;
+        }
+    }
+}

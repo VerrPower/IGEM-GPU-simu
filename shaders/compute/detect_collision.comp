@@ -1,0 +1,158 @@
+// collide
+#version 460 core
+
+#include "DeviceParams.comp"
+
+layout( local_size_x = WG_SIZE,
+        local_size_y = 1,
+        local_size_z = 1
+) in;
+
+#define Cap_Cap_rep  500.0f
+#define Cap_Cap_damp 10.0f
+#define Cap_Cap_fric 5.0f
+
+#define Cap_Circle_rep  500.02f
+#define Cap_Circle_damp 10.0f
+#define Cap_Circle_fric 5.0f
+
+#define L21 (4.0f * CAPSULE_RADIUS * CAPSULE_RADIUS)
+#define L22 (CAPSULE_RADIUS + CIRCLE_RADIUS) * (CAPSULE_RADIUS + CIRCLE_RADIUS)
+#define a   (CAPSULE_CENTER_DIST * CAPSULE_CENTER_DIST)
+#define c   (CAPSULE_CENTER_DIST * CAPSULE_CENTER_DIST)
+
+const int xstep[] = {0, -1, -1, -1, 0, 0, 1, 1, 1};
+const int ystep[] = {0, -1,  0,  1, 1,-1,-1, 0, 1};
+
+#define m_inv (1.0f / m)
+#define I_inv (1.0f / I)
+
+void main(){
+    uint EID = gl_GlobalInvocationID.x;
+    if(EID >= NUM_CAPSULE) return;
+
+    Capsule P = capsules[EID];
+    vec2 pos = P.pos, prev_pos = P.prev_pos;
+    vec2 v1 = (pos - prev_pos) / dt;
+    float theta = P.theta, prev_theta = P.prev_theta;
+    float omega1 = (theta - prev_theta) / dt;
+    vec2 dir = vec2(cos(theta), sin(theta));
+    vec2 P1 = pos - dir * hhE, u = dir * hE;
+    int Cx = int(clamp(floor(pos.x * cell_sz_inv), 0, GRID_WIDTH  - 1));
+    int Cy = int(clamp(floor(pos.y * cell_sz_inv), 0, GRID_HEIGHT - 1));
+
+    int overlapped = 0;
+    vec2 accum_force_on_com = vec2(0.0f, 0.0f);
+    float accum_torque = 0.0f;
+
+    for(int dirId = 0; dirId < 9; dirId++){
+        int nx = Cx + xstep[dirId], ny = Cy + ystep[dirId];
+        if (nx<0 || ny<0 || nx>=GRID_WIDTH || ny>=GRID_HEIGHT) continue;
+        uint cellId = uint(ny) * GRID_WIDTH + uint(nx);
+
+        //------------------------------collide with surrounding ECOLIS--------------------------
+        uint count = counts_list[cellId];
+        uint ecoliBase = cellId * MAX_CAPSULE_PER_CELL;
+        for(uint i = 0; i < count; i++){
+            uint eid2 = indices_table[ecoliBase + i];
+            if(eid2 == EID) continue;
+            Capsule Q = capsules[eid2];
+
+            // ········· extract dynamics ·········
+            vec2 pos2 = Q.pos, prev_pos2 = Q.prev_pos;
+            float theta2 = Q.theta, prev_theta2 = Q.prev_theta;
+            vec2 v2 = (pos2 - prev_pos2) / dt;
+            float omega2 = (theta2 - prev_theta2) / dt;
+            vec2 dir2 = vec2(cos(theta2), sin(theta2));
+            vec2 Q1 = pos2 - dir2 * hhE, v = dir2 * hE;
+
+            // ········· overlap detection ·········
+            vec2 w = P1 - Q1;
+            float b = dot(u, v), D = a * c - b * b, d = dot(w, v), e = dot(w, u);
+            float s = (abs(D) < 1e-8) ? 0.0f : clamp((b * d - c * e)/D, 0, 1), t = (b * s + d) / c;
+            if(t < 0.0f || 1.0f < t)  t = clamp(t, 0.0f, 1.0f); s = clamp((b * t - e)/a, 0.0f, 1.0f);
+            vec2 P0 = P1 + u * s, Q0 = Q1 + v * t;
+            vec2 P_to_Q = Q0 - P0;
+            float MD2 = dot(P_to_Q, P_to_Q);
+            if(MD2 > L21) continue;
+
+            // ········· applying forces ·········
+            overlapped = 1;
+            float depth = 2 * rE - sqrt(MD2);
+            vec2 n = normalize(P_to_Q), T = (P0 + Q0) / 2.0f;
+            vec2 r1 = T - pos, r2 = T - pos2;
+            vec2 r1T = vec2(-r1.y, r1.x), r2T = vec2(-r2.y, r2.x);
+            vec2 v1_pt = r1T * omega1 + v1, v2_pt = r2T * omega2 + v2;
+            vec2 v_rel = v1_pt - v2_pt;
+            float v_rel_mag = dot(v_rel, n);
+
+            vec2 F_rep = - depth * Cap_Cap_rep * n;
+            vec2 F_damp =  - max(0, v_rel_mag) * Cap_Cap_damp * n;
+            vec2 F_frict =  - (v_rel - v_rel_mag * n) * Cap_Cap_fric;
+            vec2 F_sum = F_rep + F_damp + F_frict;
+
+            accum_force_on_com += F_sum;
+            accum_torque += dot(F_sum, r1T);
+        }
+
+        //------------------------------collide with surrounding CAURIS--------------------------
+        uint count_f = counts_list_f[cellId];
+        uint caurisBase = cellId * MAX_CIRCLE_PER_CELL;
+
+        for(uint i = 0; i < count_f; i++){
+            uint cid = indices_table_f[caurisBase + i];
+            Obstacle C = cauris[cid];
+
+            // ········· overlap detection ·········
+            vec2 Q0 = C.pos, v = P1 - Q0;
+            float b = dot(u, v), s = clamp(-b/a, 0, 1);
+            vec2 P0 = P1 + u * s, P_to_Q = Q0 - P0;
+            float MD2 = dot(P_to_Q, P_to_Q);
+            if(MD2 > L22) continue;
+
+            // ········· applying forces ·········
+            cauris[cid].health -= 0.01f;
+
+            overlapped = 1;
+            vec2 n = inversesqrt(MD2) * (P_to_Q);
+            vec2 r = (P0 + Q0) / 2 - pos;
+            vec2 rT = vec2(-r.y, r.x);
+            float depth = rE + rC - sqrt(MD2);
+            float v_rel_mag = dot(v1, n);
+
+            vec2 F_rep = - depth * Cap_Circle_rep * n;
+            vec2 F_damp = - max(0, v_rel_mag) * Cap_Circle_damp * n;
+            vec2 F_frict = - (v1 - v_rel_mag * n) * Cap_Circle_fric;
+            vec2 F_sum = F_rep + F_damp + F_frict;
+
+            accum_force_on_com += F_sum;
+            accum_torque += dot(F_rep, rT) ;
+        }
+    }
+    #ifdef COLLISION_DETECTION_ENABLED
+    capsules[EID].overlapped = overlapped;
+    capsules[EID].acc += accum_force_on_com * m_inv;
+    capsules[EID].angular_acc += accum_torque * I_inv;
+    #endif
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
